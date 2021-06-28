@@ -10,6 +10,7 @@
 \usepackage{ulem}
 \usepackage{dsfont}
 \input{epsf}
+\usepackage[lined]{algorithm2e}
 %\usepackage{floatflt}
 %\usepackage{wrapfig}
 %\usepackage{subfig}
@@ -39,7 +40,7 @@
 %\renewcommand\floatpagefraction{.9}
 \renewcommand\topfraction{.9}
 \renewcommand\bottomfraction{.9}
-\renewcommand\textfraction{.1}   
+\renewcommand\textfraction{.1}
 \setcounter{totalnumber}{50}
 \setcounter{topnumber}{50}
 \setcounter{bottomnumber}{50}
@@ -153,7 +154,7 @@ Our contribution in this paper is that we modify the two-sample testing approach
 
 \section{The need to bridge outlier detection and drift detection}
 
-We briefly describe two properties of practical applications statistical monitoring of model inputs that indicate that two-sample testing as described by \cite{FailingLoudly} does not fully meet the requirements for detecting drift. One is an à priori consideration, while the other is an empirical observation from practical use of the method.
+We briefly describe two properties of practical applications statistical monitoring of model inputs that indicate that two-sample testing as described by \cite{FailingLoudly} does not fully meet the requirements for detecting drift. One is an Ã  priori consideration, while the other is an empirical observation from practical use of the method.
 
 From a philosophical perspective, we see the following deficit in framing drift detection as a two-sample problem. The null hypothesis we statistically test against is that the reference and test samples have  been drawn from the same distribution. However, there are many reasons why we believe that this assumption is often deeply unrealistic:
 
@@ -167,7 +168,7 @@ One way to mitigate these effects could be to enlarge the data sample (and the t
 
 Note how outlier detection would, in the situations described above, conclude that the inputs are not outliers. However, we still want the model monitoring to consider a collapse of the input distribution (e.g. a frozen camera image from a visual inspection system) to be flagged as problematic, but an outlier detection, unaware of the distribution of the inputs beyond a single given sample, cannot identify this. In this sense, we need a bridge between drift detection and outlier detection: We want the multi-sample approach on the test side like drift detection. At the same time we aim to remove the requirement to compare against the full test distribution, a requirement that outlier detection does not have. 
 
-We believe that this à priori consideration highlights at least partially the cause of the following observation from applying drift detection to practical problems:
+We believe that this Ã  priori consideration highlights at least partially the cause of the following observation from applying drift detection to practical problems:
 The statistical testing often leads to the rejection of the hypothesis that the reference and test distribution are the same with extremely high confidence (extremely low p-values like $10^{-10}$) even when human inspection would conclude that no relevant drift has taken place. This appears to be an indication that the hypothesis we are testing is not well-matched to what we actually want to detect.
 In practice, we may \textit{calibrate} the drift detection to consider values of the test statistic observed during normal operation, say at the beginning or during the test of a deployment, but this may lead our testing to miss actual cases and is not very satisfying philosophically.
 
@@ -274,6 +275,60 @@ subject to the same constraints.
 
 With the generic quadratic programming or constrained least squares solvers in common software packages like SciPy, using this approach appears to be prohibitively costly compared to the two-stage method, so we did not persue it further (in the base case a single evaluation of the $MMD^\alpha$ took about 2.5 seconds, this compares to less than 0.14 seconds for the four methods in our empirical evaluation. While this direct approach is theoretically more satisfying than the two-stage approach, this implementation concern led us to not consider it further.
 
+\subsection{Ad hoc optimization}
+
+We may formulate an ad hoc optimization taking Newton-type steps on the coordinates which are not on the boundary. One of the choices our in our implementation is to use a fixed (heuristic) size for the loops in order to minimize
+GPU synchronizations.
+
+We take as set of \textit{working coordinates} the coordinates which are not on the boundary of the admissible set and a (pseudo-randomized) subset of coordinates on the boundary for which the gradients are strongly pointing inwards.
+Then we compute an update direction with the Newton update on the working coordinates.
+To deal with distortions from (approximately) enforcing the constraints \eqref{eq:constraints}, we reduce step sizes and see if we actually get an improvement.
+We empirially saw that Newton steps can get stuck, so we also do a number of gradient steps.
+
+Our exact procedure is given in Algorithm \ref{alg:adhoc-opt}.
+
+\begin{algorithm}
+  \SetAlgoLined
+  \SetKwComment{comment}{\# }{}
+  \KwIn{Kernel matrices $K^X$, $K^Y$, $K^{XY}$, fraction $\alpha$ to match}
+  \KwOut{Approximate minimizing weight $w$}
+  $w$ := $(1/n,...1/n) \in \mathbb{R}^n$\;
+  $\widehat{MMD^\alpha}^2(w)$ := $w^T K^X w + v \sum K^Y v^T - 2 w^T K^{XY} v$\;
+  \For{$N_{iter}$ iterations}{
+       $r$ := random number $0...1$\;
+       $gr$ := $2 K^X w - 2 K^XY v$\;
+       $gr_{min}$ := $\min \{gr_i | w_i < \frac{1}{\alpha n}\}$\;
+       $gr_{max}$ := $\max \{gr_i | w_i > 0\}$\;
+
+       $working$ := $\{i | ((w_i > 0) \text{ or } (gr_i < gr_{min} * r))  \text{ and }  ((w_i < \frac{1}{\alpha n})  \text{ or } (gr_i > gr_{max} * r))$\;
+
+       $upd_{working}$ := $(K^X_{working})^{-1} gr_{working}$; \comment{implemented using Cholesky }
+
+       \For{$step \in \{ 1, 1/5, 1/25, ..., 1/5^4 \}$}{
+         $w_{cand}$ = $w - step * upd_{working}$\;
+         $w_{cand}$ = clamp($w_{cand}$, min=$0$, max=$\frac{1}{\alpha n}$)\;
+         $w_{cand}$ = $w_{cand} / \sum w_{cand}$; \comment{this potentially lets $w$ violate the upper bound}
+         \If{$\widehat{MMD^\alpha}^2(w_{cand}) < \widehat{MMD^\alpha}^2(w)$ }{
+           $w$ := $w_{cand}$\;}
+       }
+
+       recompute $gr$, $gr_{min}$, $gr_{max}$, and $working$ \;
+       $upd_{working}$ := $gr_{working} - \frac{1}{\#working} \sum gr_{working}$\;
+       \For{$step \in \{ 0.1, 0.1/5, 0.1/25, ..., 0.1/5^4 \}$}{
+         $w_{cand}$ = $w - step * upd_{working}$\;
+         $w_{cand}$ = clamp($w_{cand}$, min=$0$, max=$\frac{1}{\alpha n}$)\;
+         $w_{cand}$ = $w_{cand} / \sum w_{cand}$\;
+         \If{$\widehat{MMD^\alpha}^2(w_{cand}) < \widehat{MMD^\alpha}^2(w)$ }{
+           $w$ := $w_{cand}$\;}
+       }
+     }
+     \KwRet{$w$}
+
+  \caption{Ad-hoc constrained optimization using PyTorch CUDA primitives}\label{alg:adhoc-opt}
+\end{algorithm}
+
+In our empirical observation, this, delivered a good approximation to the results computed by stock quadratic programming as described above, but is also considerably slower than the optimal transport based upper bound below.
+
 \subsection{Optimal transport based upper bound for the partial MMD}
 
 To avoid the computational burden of the quadratic programming problem,
@@ -284,6 +339,8 @@ an upper bound to the partial MMD distance $MMD^\alpha$.
 Recall that Wasserstein coupling $P_{ij}$ sums to the marginals.
 In particular, $w_i = \frac{1}{\alpha} \sum_{j=1}^M P_{ij}$ is admissible in the quadratic programming problem \eqref{eq:qp}, i.e. statisfies the constraints \eqref{eq:constraints}, giving an upper bound to the minimum.
 Plugging this $w$ into the MMD formula \eqref{eq:mmd_matrix} gives us the approximate partial MMD drift detector.
+
+The MMD distance bounds obtained through this method do not appear to be a good approximation to the partial MMD distances, but they do result in a test that performed reliably in our experimental evaluation below.
 
 \section{$p$-values: Revisiting bootstrapping}
 \label{sec:bootstrapping}
@@ -319,22 +376,27 @@ As practicioners, we observed that some techniques (notably the \textit{untraine
 
 Our comparison point is the kernel MMD distance as implemented by \texttt{torchdrift} \cite{torchdrift}. This largely follows the implementation provided with \cite{FailingLoudly}, but has a lengthscale heuristic closer to the original MMD code \cite{Gretton}.
 We base our model on the pre-trained (on ImageNet) ResNet 18 backbone from TorchVision. Following the fine-tuning approach, we re-use the convolutional part as is and train a two-layer head, with intermediate activation size $32$.
-We use this fine-tuned network up to this $32$-dimensional activation as our feature extractor. The reference distribution is taken as 1000 random images from the training set. All testing is done against samples from the test set. We run the test on 1000 balanced and 1000 imbalanced sample draws. For the balanced sample draws, we draw randomly from the test distribution. For easy implementation with PyTorch dataloaders, we sample with repetition. For the imbalanced samples, we stratify the test set into the 10 classes and for each of them draw 100 batches from that said class (again, with repetition). These samples are then corrupted by gaussian blur (of a severity level matched to parameters modelled after \cite{Hendrycks}, implemented in TorchDrift). 
+We use this fine-tuned network up to this $32$-dimensional activation as our feature extractor. The reference distribution is taken as 1000 random images from the training set. All testing is done against samples from the test set. We run the test on 1000 balanced and 1000 imbalanced sample draws. For the balanced sample draws, we draw randomly from the test distribution. For easy implementation with PyTorch dataloaders, we sample with repetition. For the imbalanced samples, we stratify the test set into the 10 classes and for each of them draw 100 batches from that said class (again, with repetition). These samples are then corrupted by gaussian blur (of a severity level matched to parameters modelled after \cite{Hendrycks}, implemented in TorchDrift). Over the 10 trial runs, the trained models achieve a mean accuracy of $93.6\%$ on the uncorrupted test set. This drops to $85.6\%$ with the baseline blur (strength 2) and $91.1\%$ and $74.7\%$ with the weaker stronger blur sensitivities (strength 1 and 3, respectively).
 
 We evaluate four drift detectors:
 \begin{itemize}
 \item The MMD drift detector, as presented in \cite{FailingLoudly} and implemented in TorchDrift,
 \item a drift detector using the Wasserstein metric (matching the full reference distribution),
 \item the drift detector of Section \ref{sec:partial_wasserstein} using the Wasserstein metric matching a part of the reference distribution,
-\item the partial MMD drift detector of Section \ref{sec:partial_mmd}, more precisely the approximation using the Wasserstein coupling to derive the weight.
+\item the partial MMD drift detector of Section \ref{sec:partial_mmd} in three variants, the \textit{two-stage} setup using the Wasserstein coupling to compute the weight,
+\item the \textit{approximative} partial MMD using the ad-hoc constrained optimization, and
+\item the partial MMD computed using a \textit{QP}-package (\texttt{qpsolver}) to solve the constrained least squares problem. As this variant takes much more time than the others,
+  we only computed this for the base scenario (not the sensitivities) and only computed every fifth test batch to derive the statistics presented below. Also we used only 100 bootstrap permutations to compute the test statistic under the null hypothesis.
 \end{itemize}
 
 \begin{figure}
-\includegraphics[width=3.75cm]{experiment/experiment.stl10rn18.run_0.corruption_strength_3-N_test_50-fraction_to_match_0.05-wasserstein_p_2.0.mmd_fit.pdf}
-\includegraphics[width=3.75cm]{experiment/experiment.stl10rn18.run_0.corruption_strength_3-N_test_50-fraction_to_match_0.05-wasserstein_p_2.0.wfull_fit.pdf}
-\includegraphics[width=3.75cm]{experiment/experiment.stl10rn18.run_0.corruption_strength_3-N_test_50-fraction_to_match_0.05-wasserstein_p_2.0.wpart_fit.pdf}
-\includegraphics[width=3.75cm]{experiment/experiment.stl10rn18.run_0.corruption_strength_3-N_test_50-fraction_to_match_0.05-wasserstein_p_2.0.twostage_fit.pdf}
-\caption{\label{fig:goodness-of-fit} Graphical goodness of fit evaluations using the shifted gamma distribution.}
+\includegraphics[width=5cm]{experiment/v1/experiment.stl10rn18.run_0.corruption_strength_2-N_test_50-fraction_to_match_0.05-wasserstein_p_2.0.mmd_fit.pdf}
+\includegraphics[width=5cm]{experiment/v1/experiment.stl10rn18.run_0.corruption_strength_2-N_test_50-fraction_to_match_0.05-wasserstein_p_2.0.wfull_fit.pdf}
+\includegraphics[width=5cm]{experiment/v1/experiment.stl10rn18.run_0.corruption_strength_2-N_test_50-fraction_to_match_0.05-wasserstein_p_2.0.wpart_fit.pdf} \\
+\includegraphics[width=5cm]{experiment/v1/experiment.stl10rn18.run_0.corruption_strength_2-N_test_50-fraction_to_match_0.05-wasserstein_p_2.0.twostage_fit.pdf}
+\includegraphics[width=5cm]{experiment/v1/experiment.stl10rn18.run_0.corruption_strength_2-N_test_50-fraction_to_match_0.05-wasserstein_p_2.0.pmmd_approx_fit.pdf}
+\includegraphics[width=5cm]{experiment/v1/experiment.stl10rn18.run_0.corruption_strength_2-N_test_50-fraction_to_match_0.05-wasserstein_p_2.0.pmmd_qp_fit.pdf}
+\caption{\label{fig:goodness-of-fit} Graphical goodness of fit evaluations using the shifted gamma distribution. Note that the QP-based partial MMD is only fit to 100 bootstrap permutations whereas the others use 1000 bootstrap permutations each.}
 \end{figure}
 
 Figure \ref{fig:goodness-of-fit} shows the goodness of fit of the fitted shifted gamma distribution as described in Section \ref{sec:bootstrapping}.
@@ -342,39 +404,38 @@ Figure \ref{fig:goodness-of-fit} shows the goodness of fit of the fitted shifted
 One could also fit this instance of the partial Wasserstein distribution with a normal, but the shifted gamma fit seems to give good results in particular at the right tail, which is of interest to us. A possible extension would be to switch between normal approximation and shifted gamma distribution based on the kurtosis.
 
 \begin{figure}
-  \includegraphics[width=15cm]{experiment/deciles_with_error_bars_base.pdf}
+  \includegraphics[width=15cm]{experiment/v1/deciles_with_error_bars_base.pdf}
   \caption{\label{fig:histograms} $p$-value histograms with error bars. Ideally, the left two columns would should a uniform distribution (blue line), while the right two columns would show concentration very much to the left. Here, we do not see the distribution at the lower end, but the ROC curves tell us that for MMD and the full Wasserstein distance, a significant number of draws from the imbalanced value have drift $p$-values lower than those of balanced corrupted samples.}
 \end{figure}
 
 
-We compute the $p$-values for the test statistics to evaluate the mismatch between the botstrapped $p$-values and the actual distributions. For 10 runs of the base experiment, a histogram of them is shown in Figure \ref{fig:histograms}.  We cannot necessarily expect the $p$-value to give the false positive rate in this setting, so we plot histograms of observed $p$-values for corrupted and uncorrupted balanced and imbalanced sample draws, so we regard the $p$-values more as a communication tool. The MMD distance appears to be more robust than the Wasserstein distance. However, as expected, imbalanced data throws off the drift detection by causing very low $p$-values (corresponding to false positives), while the partial Wasserstein distance based drift detection can cope relatively well with these. For the partial Wasserstein distance, corrupted samples can achieve rather high $p$-values, leading to false negatives. This is remedied by using the partial MMD distance.
-
+We compute the $p$-values for the test statistics to evaluate the mismatch between the botstrapped $p$-values and the actual distributions. For 10 runs of the base experiment, a histogram of them is shown in Figure \ref{fig:histograms}.  We cannot necessarily expect the $p$-value to give the false positive rate in this setting, so we plot histograms of observed $p$-values for corrupted and uncorrupted balanced and imbalanced sample draws, so we regard the $p$-values more as a communication tool. The MMD distance appears to be more robust than the Wasserstein distance. However, as expected, imbalanced data throws off the drift detection by causing very low $p$-values (corresponding to false positives), while the partial Wasserstein distance based drift detection can cope relatively well with these. For the partial Wasserstein distance, corrupted samples can achieve rather high $p$-values, leading to false negatives. This is remedied by using the partial MMD distance in any of the three variants discussed above.
 
 \begin{figure}
-\includegraphics[width=5cm]{experiment/roc-curves-10-trials-base.pdf}
-\caption{\label{fig:roc_curves_base} 10 ROC curves for the detection in the base configuration of the experiment. The full-sample drift detectiors clearly show a large number of false positives at the left, this is from the imbalanced but not corrupted draws. The partial Wasserstein curve usually is much steeper in the beginning but can be slow to reach very high true positives. This reflects the spread of the $p$-value mass in the histograms for draws of corrupted samples.}
+\includegraphics[width=5cm]{experiment/v1/roc-curves-10-trials-base.pdf}
+\includegraphics[width=5cm]{experiment/v1/roc-curves-10-trials-corr_strength_1.pdf}
+\caption{\label{fig:roc_curves_base} 10 ROC curves for the detection in the base configuration of the experiment and the low-corruption sensitivity. The full-sample drift detectiors clearly show a large number of false positives at the left, this is from the imbalanced but not corrupted draws. The (partial) Wasserstein distance detector performs much worse than the ones based on the MMD distance, including the two-stage one, and very poorly in the low-corruption experiment. This reflects the spread of the $p$-value mass in the histograms for draws of corrupted samples.}
 \end{figure}
 
 For the receiver operating curve (ROC) we pool the balanced and unbalanced examples and then set a $p$-value threshold (which is equivalent to a threshold on the statistic itself). The resut for 10 runs of the base experiments are shown in Figure \ref{fig:roc_curves_base}.
-It turns out that the drift detection using the (full sample) Wasserstein distance has more difficulty at detecting some drifts than that based on the MMD distance. However, both exibit man false positives (a very small slope in the beginning), while the partial Wasserstein distance drift detector does not. The advantage of the partial Wasserstein drift detector is more pronounced with stronger severity of the applied corruption but the detection is inferior for low severities. The partial MMD drift detector performs very well even in the in situations where using the partial Wasserstein distance does not give good drift detectors. This is also reflected in the AUC scores reported below.
+It turns out that the drift detection using the (full sample) Wasserstein distance has more difficulty at detecting some drifts than that based on the MMD distance. However, both exibit many false positives (a very small slope in the beginning), while the partial Wasserstein distance drift detector performs better (in the base case). The advantage of the partial Wasserstein drift detector is more pronounced with stronger severity of the applied corruption but the detection rate is quite bad for low severities. The partial MMD drift detector in any variant performs very well even in the in situations where using the partial Wasserstein distance does not give good drift detectors. This is also reflected in the AUC scores reported below.
 
 To investigate the dependence of our results on experimental parameters, we repeated the experiment while applying the following variations and report the AUC change for 10 runs each. Figure \ref{fig:auc_sensitivities} shows the results.
 
-Reducing the strength of the drift significantly reduces the the detection, strengthening it simplifies the detection of drifted batches. The (partial and full) Wasserstein-based drift detectors' sensitivities suffer significantly when the strength is reduced while the MMD-based drift detectors (full and partial) are do not see a large decrease in sensitivity.
+\begin{figure}
+\includegraphics[width=15cm]{experiment/v1/auc_for_sensitivities.pdf}
+\caption{\label{fig:auc_sensitivities} Area under the ROC curve for various sensitivities, from 10 runs each. In the leftmost column we vary the severity of the gaussian blur we use to simulate drifted data. In the second column, we change the size of the tested sample and adjust the fraction to match accordingly. In the third column we change the fraction to much but leave the test size at 50 (and reference at 1000), creating a mismatch of sorts. In the rightmost column, we vary the exponent $p$ of the Wasserstein distance definition.}
+\end{figure}
 
-Running the drift detection on smaller test sets (20 instead of 50) adversely impacts the partial wasserstein drift detector, increasing it (to 100) greatly helps. This is expected. Note that the impact on the MMD-based detector is very small, pointing to better robustness and sample efficiency. Interestingly, this is also true for the partial MMD drift detector.
+Reducing the strength of the drift significantly reduces the the detection, strengthening it simplifies the detection of drifted batches. The (partial and full) Wasserstein-based drift detectors' sensitivities perform badly in the base and weak drift scenarios, and only start to work better in the strong drift scenario. The range of drifts in which the MMD-based drift detectors (full and partial) show good results is much broader, including the base scanrio and to some extend also the one with weaker drift.
+
+Running the drift detection on smaller test sets (20 instead of 50) adversely impacts the partial wasserstein drift detector, increasing it (to 100) helps. This is expected. Note that the impact on the MMD-based detector is relatively small, pointing to better robustness and sample efficiency. Interestingly, this is also true for the two-stage partial MMD drift detector which uses the optimal transport coupling from the Wasserstein distance to obtain the weight for the points in the MMD formula.
 
 Introducing a mismatch in the fraction to match forces the partial Wasserstein drift detector to match to several reference samples. It is perhaps surprising that reducing the fraction to match reduces the efficiency, as it would seem that the (partial) coupling could simply be scaled. Increasing the fraction to match appears to improve the detection a bit, but note that we stay at $10\%$, which is the expected fraction of samples of any given class in the reference sample. (As expected, the other detectors are not impacted by a parameter change that does not affect them at all).
 
-Varying the exponent $p$ in the Wasserstein distance form the central $2$ to $1$ appears to not significantly impact the results, increasing to $4$ appears to to add some reliability for the partial Wasserstein detector.
+Varying the exponent $p$ in the Wasserstein distance form the central $2$ to $1$ appears to not significantly impact the results. In a previous run of the experiments with higher corruption strength, increasing to $4$ appears to to add some reliability for the partial Wasserstein detector, but we can not not observe this here.
 
-In experimentation we observed that, albeit very rarely, the detection rate of the Wasserstein-distance based detector can break down (and much more so than the MMD-based one). From the experimental observation, it appears to be linked to the quality of the feature extractor, caused by the training: If the quality of detection was either poor or good in all 9 tests with the same feature extractor (which use separate reference distribution drawings and so exclude this as a factor).
-
-
-\begin{figure}
-\includegraphics[width=15cm]{experiment/auc_for_sensitivities.pdf}
-\caption{\label{fig:auc_sensitivities} Area under the ROC curve for various sensitivities, from 10 runs each. In the leftmost column we vary the severity of the gaussian blur we use to simulate drifted data. In the second column, we change the size of the tested sample and adjust the fraction to match accordingly. In the third column we change the fraction to much but leave the test size at 50 (and reference at 1000), creating a mismatch of sorts. In the rightmost column, we vary the exponent $p$ of the Wasserstein distance definition.}
-\end{figure}
+As we see in Figure~\ref{fig:auc_sensitivities}, the detection rate of the partial Wasserstein-distance based detector is much more volatile than those of the MMD-based ones. From a more detailed observation, it may be linked to the quality of the feature extractor, caused by the training: If the quality of detection was either poor or good in all 9 sensitivities of a given run with the same feature extractor (which use separate reference distribution drawings and so exclude this as a factor).
 
 
 All our code is available at \url{https://github.com/torchdrift/partial-wasserstein}.
@@ -384,15 +445,16 @@ All our code is available at \url{https://github.com/torchdrift/partial-wasserst
 
 \section{Attribution}
 
-For analysis, it is useful to attribute contributions to the drift scrore to each point. For the MMD distance, this can be done using the witness function (see \cite{Gretton}). For the Wasserstein distance, we have even more precise information, as the coupling matches points. Even though a point in the test is mapped to several reference points in general, we expect these to be few or a single one (if the fraction has been calibrated to the relation of test and reference sample sizes). This is more convenient for human inspection (e.g. has the point been mapped to an element of the same class, how large is the distance compared to an average distance etc., which pairings contribute the most to the distance).
-Figure \ref{fig:matching} shows a coupling (dots at non-zero weights) as well as a t-SNE projection of the reference and test points along with the matching.
-
 \begin{figure}
-  \includegraphics[width=15cm]{experiment/plot_coupling.pdf}
-  \includegraphics[width=15cm]{experiment/match_coupling.pdf}
+  \includegraphics[width=15cm]{experiment/v1/plot_coupling.pdf}
+  \includegraphics[width=15cm]{experiment/v1/match_coupling.pdf}
   
   \caption{\label{fig:matching} The coupling typically is relatively sparsely supported. Top plot: ``heatmap'' of the coupling, the coupling typically has very concentrated mass. (While the optimal coupling is not unique, it is for ``generic'' configurations.)} Bottom plot: Embedding the reference (blue) and an imbalanced test sample (orange) with the coupling.
 \end{figure}
+
+
+For analysis, it is useful to attribute contributions to the drift scrore to each point. For the MMD distance, this can be done using the witness function (see \cite{Gretton}). For the Wasserstein distance, we have even more precise information, as the coupling matches points. Even though a point in the test is mapped to several reference points in general, we expect these to be few or a single one (if the fraction has been calibrated to the relation of test and reference sample sizes). This is more convenient for human inspection (e.g. has the point been mapped to an element of the same class, how large is the distance compared to an average distance etc., which pairings contribute the most to the distance).
+Figure \ref{fig:matching} shows a coupling (dots at non-zero weights) as well as a t-SNE projection of the reference and test points along with the matching.
 
 
 
@@ -412,7 +474,7 @@ The partial MMD distance and its computationally efficient upper bound approxima
 We thank Luca Antiga, Daniele Cortinovis, and Lisa Lozza for inspiring discussions on the subject.
 
 \begin{thebibliography}{99}
-\bibitem{CaffarelliMcCann} L. Caffarelli \& R. McCann, \textit{Free boundaries in optimal transport and Monge-Ampère obstacle problems.}, Annals of Mathematics (171), 2010.
+\bibitem{CaffarelliMcCann} L. Caffarelli \& R. McCann, \textit{Free boundaries in optimal transport and Monge-AmpÃ¨re obstacle problems.}, Annals of Mathematics (171), 2010.
 \bibitem{Chapel} L. Chapel et al., \textit{Partial Optimal Transport with Applications on Positive-Unlabeled Learning}, NeurIPS 2020.
 \bibitem{STL10} A. Coates et al., \textit{An Analysis of Single Layer Networks in Unsupervised Feature Learning}, AISTATS, 2011.
 \bibitem{Cuturi} M. Cuturi, \emph{Sinkhorn Distances: Lightspeed Computation of Optimal Transport}, NIPS 2013.
@@ -420,7 +482,7 @@ We thank Luca Antiga, Daniele Cortinovis, and Lisa Lozza for inspiring discussio
 \bibitem{Gretton} Gretton, A. et al.: \emph{A Kernel Two-Sample Test.} JMLR 2012.
 \bibitem{Hendrycks} D. Hendrycks \& T. Dietterich. \emph{Benchmarking Neural Network Robustness to Common Corruptions and Perturbations}, ICLR 2019.
 \bibitem{SRW}  Paty, F. \& Cuturi, M.. \emph{Subspace Robust Wasserstein Distances}, ICML 2019 / PMLR 97:5072-5081.
-\bibitem{PeyreCuturi} G. Peyré, M. Cuturi, \emph{Computational Optimal Transport}, arXiv 1803.00578v4.
+\bibitem{PeyreCuturi} G. PeyrÃ©, M. Cuturi, \emph{Computational Optimal Transport}, arXiv 1803.00578v4.
 \bibitem{FailingLoudly} S. Rabanser et. al., \emph{Failing Loudly: An Empirical Study of Methods for Detecting Dataset Shift}, NeurIPS 2019.
 \bibitem{Ramdas} A. Ramdas et al., \emph{On Wasserstein Two-Sample Testing and Related Families of Nonparametric Tests}, Entropy (19), 2017. 
 \bibitem{alibidetect} A. Van Looveren et al., \emph{Alibi Detect: Algorithms for outlier, adversarial and drift detection}, \url{https://github.com/SeldonIO/alibi-detect}.
